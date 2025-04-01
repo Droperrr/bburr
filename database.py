@@ -1,96 +1,77 @@
-# database.py
 import sqlite3
-import logging
-from datetime import datetime
-from config import DB_PATH
+import threading
+import os
 
-logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[logging.FileHandler('token_monitor.log'), logging.StreamHandler()]
-)
-logger = logging.getLogger(__name__)
+# Указываем новый путь к базе данных
+DB_PATH = r"D:\auto\burn\token_transactions.db"
+
+# Проверяем, существует ли директория, и создаем её, если нет
+os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+
+# Глобальное соединение и блокировка
+_conn = None
+_lock = threading.Lock()
+
+def init_db(db_path=DB_PATH):
+    """Инициализирует базу данных, создаёт таблицу transactions, если она не существует."""
+    global _conn
+    _conn = sqlite3.connect(db_path, timeout=10)  # Таймаут 10 секунд
+    cursor = _conn.cursor()
+    
+    # Создаём таблицу, если она ещё не существует
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            token_id INTEGER,
+            signature TEXT UNIQUE,
+            block INTEGER,
+            timestamp DATETIME,
+            type TEXT,
+            from_address TEXT,
+            to_address TEXT,
+            amount REAL,
+            symbol TEXT,
+            value_sol REAL,  -- Новое поле для стоимости в SOL
+            is_initial_recipient INTEGER DEFAULT 0
+        )
+    ''')
+    
+    # Проверяем, есть ли столбец is_initial_recipient
+    cursor.execute("PRAGMA table_info(transactions)")
+    columns = [col[1] for col in cursor.fetchall()]
+    if "is_initial_recipient" not in columns:
+        cursor.execute("ALTER TABLE transactions ADD COLUMN is_initial_recipient INTEGER DEFAULT 0")
+        print("Добавлен столбец is_initial_recipient в таблицу transactions")
+    
+    # Проверяем, есть ли столбец value_sol
+    if "value_sol" not in columns:
+        cursor.execute("ALTER TABLE transactions ADD COLUMN value_sol REAL")
+        print("Добавлен столбец value_sol в таблицу transactions")
+    
+    _conn.commit()
+
+def save_transaction(token_id, signature, block, timestamp, type_, from_address, to_address, amount, symbol, value_sol=None, is_initial_recipient=0):
+    """Сохраняет транзакцию в базу данных с синхронизацией."""
+    with _lock:  # Синхронизируем доступ
+        cursor = _conn.cursor()
+        try:
+            cursor.execute('''
+                INSERT OR IGNORE INTO transactions (token_id, signature, block, timestamp, type, from_address, to_address, amount, symbol, value_sol, is_initial_recipient)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (token_id, signature, block, str(timestamp), type_, from_address, to_address, amount, symbol, value_sol, is_initial_recipient))
+            _conn.commit()
+        except sqlite3.OperationalError as e:
+            print(f"Ошибка базы данных при сохранении транзакции {signature}: {e}")
+        except Exception as e:
+            print(f"Неизвестная ошибка при сохранении транзакции {signature}: {e}")
 
 def get_db_connection():
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    return conn, cursor
+    """Возвращает глобальное соединение и курсор для базы данных."""
+    return _conn, _conn.cursor()
 
-def initialize_database():
-    conn, cursor = get_db_connection()
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS tokens (
-        token_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        mint_address TEXT UNIQUE,
-        symbol TEXT,
-        total_supply REAL,
-        decimals INTEGER,
-        mcap_ath REAL
-    )
-    ''')
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS transactions (
-        transaction_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        token_id INTEGER,
-        signature TEXT,
-        block INTEGER,
-        timestamp DATETIME,
-        action TEXT,
-        from_address TEXT,
-        to_address TEXT,
-        amount REAL,
-        token_symbol TEXT,
-        value_usd REAL,
-        is_initial_recipient INTEGER DEFAULT 0,
-        FOREIGN KEY (token_id) REFERENCES tokens(token_id)
-    )
-    ''')
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS price_history (
-        price_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        token_id INTEGER,
-        price_usd REAL,
-        timestamp DATETIME,
-        FOREIGN KEY (token_id) REFERENCES tokens(token_id)
-    )
-    ''')
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS wallet_relations (
-        relation_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        token_id INTEGER,
-        from_address TEXT,
-        to_address TEXT,
-        transaction_id INTEGER,
-        FOREIGN KEY (token_id) REFERENCES tokens(token_id),
-        FOREIGN KEY (transaction_id) REFERENCES transactions(transaction_id)
-    )
-    ''')
-    conn.commit()
-    conn.close()
-    logger.info(f"База данных инициализирована по пути {DB_PATH}")
-
-def save_transaction(token_id, signature, block, timestamp, action, from_address, to_address, amount, token_symbol, is_initial_recipient=False):
-    conn, cursor = get_db_connection()
-    cursor.execute('''
-    INSERT INTO transactions (token_id, signature, block, timestamp, action, from_address, to_address, amount, token_symbol, is_initial_recipient)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ''', (token_id, signature, block, timestamp, action, from_address, to_address, amount, token_symbol, is_initial_recipient))
-    
-    if from_address != "unknown" and to_address != "unknown":
-        cursor.execute('''
-        INSERT INTO wallet_relations (token_id, from_address, to_address, transaction_id)
-        VALUES (?, ?, ?, ?)
-        ''', (token_id, from_address, to_address, cursor.lastrowid))
-    
-    conn.commit()
-    logger.debug(f"Сохранена транзакция: token_id={token_id}, action={action}, amount={amount}, token_symbol={token_symbol}")
-    conn.close()
-
-def save_price(token_id, price_usd, timestamp):
-    conn, cursor = get_db_connection()
-    cursor.execute('''
-    INSERT INTO price_history (token_id, price_usd, timestamp)
-    VALUES (?, ?, ?)
-    ''', (token_id, price_usd, timestamp))
-    conn.commit()
-    conn.close()
+def close_db():
+    """Закрывает соединение с базой данных при завершении работы."""
+    global _conn
+    if _conn:
+        _conn.close()
+        _conn = None

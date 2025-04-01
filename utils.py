@@ -1,4 +1,3 @@
-# utils.py
 from datetime import datetime
 from database import get_db_connection
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -14,9 +13,9 @@ def parse_timestamp(timestamp_str):
 def extract_price_from_swaps(token_id, mint_address, app):
     conn, cursor = get_db_connection()
     cursor.execute('''
-    SELECT amount, value_usd, timestamp
+    SELECT amount, timestamp
     FROM transactions
-    WHERE token_id = ? AND action = 'SWAP' AND value_usd IS NOT NULL
+    WHERE token_id = ? AND type = 'SWAP'
     ORDER BY timestamp DESC
     LIMIT 1
     ''', (token_id,))
@@ -24,14 +23,10 @@ def extract_price_from_swaps(token_id, mint_address, app):
     conn.close()
 
     if swap:
-        amount, value_usd, timestamp = swap
-        if amount > 0:
-            price_usd = value_usd / amount
-            app.log(f"Извлечена цена из SWAP для {mint_address}: {price_usd:.4f} USD на {timestamp}")
-            from database import save_price
-            save_price(token_id, price_usd, timestamp)
-            return price_usd
-    app.log(f"Не найдено SWAP-транзакций с value_usd для {mint_address}")
+        amount, timestamp = swap
+        app.log(f"Извлечена SWAP-транзакция для {mint_address} на {timestamp}, но value_usd отсутствует")
+        return None  # Пока нет value_usd в таблице
+    app.log(f"Не найдено SWAP-транзакций для {mint_address}")
     return None
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
@@ -86,7 +81,7 @@ def find_connected_wallets(token_id, max_depth=5):
     conn, cursor = get_db_connection()
     cursor.execute('''
     SELECT from_address, to_address
-    FROM wallet_relations
+    FROM transactions
     WHERE token_id = ?
     ''', (token_id,))
     relations = cursor.fetchall()
